@@ -30,12 +30,17 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
-#include <sys/mman.h>
+#ifdef __linux__
+#include <link.h>
+#else
 #include <sys/stat.h>
+#endif
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -141,8 +146,14 @@ class urmem {
   };
 
   class sig_scanner {
+    struct memory_region {
+      address_t base;
+      std::size_t size;
+    };
+
    public:
     bool init(address_t addr_in_module) {
+      _regions.clear();
 #ifdef _WIN32
       MEMORY_BASIC_INFORMATION info{};
       if (!VirtualQuery(reinterpret_cast<void *>(addr_in_module), &info,
@@ -158,55 +169,104 @@ class urmem {
         return false;
       }
 
-      _base = reinterpret_cast<address_t>(info.AllocationBase);
-      _size = pe->OptionalHeader.SizeOfImage;
+      _regions.push_back({reinterpret_cast<address_t>(info.AllocationBase),
+                          pe->OptionalHeader.SizeOfImage});
 #else
       Dl_info info{};
-      struct stat buf {};
-
       if (!dladdr(reinterpret_cast<void *>(addr_in_module), &info)) {
         return false;
       }
 
+#ifdef __linux__
+      struct scan_context {
+        address_t address;
+        std::vector<memory_region> *regions;
+      } module{addr_in_module, &_regions};
+
+      const auto collect_regions = [](dl_phdr_info *object, std::size_t,
+                                      void *data) {
+        auto *module = static_cast<scan_context *>(data);
+        bool contains_address = false;
+
+        for (std::size_t i{}; i < object->dlpi_phnum; ++i) {
+          const auto &header = object->dlpi_phdr[i];
+          if (header.p_type != PT_LOAD) {
+            continue;
+          }
+
+          const auto base = object->dlpi_addr + header.p_vaddr;
+          if (module->address >= base &&
+              module->address - base < header.p_memsz) {
+            contains_address = true;
+            break;
+          }
+        }
+
+        if (!contains_address) {
+          return 0;
+        }
+
+        for (std::size_t i{}; i < object->dlpi_phnum; ++i) {
+          const auto &header = object->dlpi_phdr[i];
+          if (header.p_type == PT_LOAD && (header.p_flags & PF_R)) {
+            module->regions->push_back(
+                {object->dlpi_addr + header.p_vaddr, header.p_memsz});
+          }
+        }
+
+        return 1;
+      };
+
+      if (!dl_iterate_phdr(collect_regions, &module) || _regions.empty()) {
+        return false;
+      }
+#else
+      struct stat buf {};
       if (stat(info.dli_fname, &buf) != 0) {
         return false;
       }
 
-      _base = reinterpret_cast<address_t>(info.dli_fbase);
-      _size = buf.st_size;
+      _regions.push_back(
+          {reinterpret_cast<address_t>(info.dli_fbase), buf.st_size});
+#endif
 #endif
       return true;
     }
 
     bool find(const char *pattern, const char *mask, address_t &addr) const {
-      auto current_byte = reinterpret_cast<byte_t *>(_base);
-      auto last_byte = current_byte + _size;
+      const auto pattern_size = std::strlen(mask);
+      for (const auto &region : _regions) {
+        if (pattern_size > region.size) {
+          continue;
+        }
 
-      std::size_t i{};
-      while (current_byte < last_byte) {
-        for (i = 0; mask[i]; ++i) {
-          if (&current_byte[i] >= last_byte ||
-              ((mask[i] != '?') &&
-               (static_cast<byte_t>(pattern[i]) != current_byte[i]))) {
-            break;
+        auto current_byte = reinterpret_cast<byte_t *>(region.base);
+        auto last_start = current_byte + (region.size - pattern_size);
+
+        while (current_byte <= last_start) {
+          std::size_t i{};
+          for (; mask[i]; ++i) {
+            if ((mask[i] != '?') &&
+                (static_cast<byte_t>(pattern[i]) != current_byte[i])) {
+              break;
+            }
           }
+
+          if (!mask[i]) {
+            addr = reinterpret_cast<address_t>(current_byte);
+
+            return true;
+          }
+
+          ++current_byte;
         }
-
-        if (!mask[i]) {
-          addr = reinterpret_cast<address_t>(current_byte);
-
-          return true;
-        }
-
-        ++current_byte;
       }
 
       return false;
     }
 
    private:
-    address_t _base{};
-    std::size_t _size{};
+    std::vector<memory_region> _regions;
   };
 
   class patch {
